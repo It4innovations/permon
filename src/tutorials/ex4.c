@@ -1,32 +1,36 @@
 
-static char help[] = "Solves a tridiagonal system with lower bound specified as a linear inequality constraint.\n\
+static char help[] = "Solves a tridiagonal system with lower bound specified as an inequality constraint.\n\
 Solves finite difference discretization of:\n\
 -u''(x) = -15,  x in [0,1]\n\
-u(0) = u(1) = 0\n\
-s.t. u(x) >= sin(4*pi*x -pi/6)/2 -2\n\
+s.t. u(x) = 1\n\
 Based on ex1.\n\
 Input parameters include:\n\
-  -n <mesh_n> : number of mesh points\n";
+  -n <mesh_n> : number of mesh points\n\
+  -sol        : view and draw the solution vector\n\
+  -draw_pause : number of seconds to pause, -1 implies until user input, see PetscDrawSetPause()\n";
 
-/*
-* Include "permonqps.h" so that we can use QPS solvers.  Note that this file
-* automatically includes:
-*   petscsys.h   - base PERMON routines
-*   permonvec.h  - Vectors
-*   permonmat.h  - Matrices
-*   permonqppf.h - Projection Factory
-*   permonqpc.h  - Quadratic Programming Constraints
-*   permonqp.h   - Quadratic Programming objects and transformations
-*   petsctao.h   - Toolkit for Advanced Optimization solvers
-*/
 #include <permonqps.h>
+#include <petscdraw.h>
+#include <math.h>
 
-/* Lower bound (obstacle) function */
-PetscReal fobst(PetscInt i,PetscInt n) {
-  PetscReal h = 1./(n-1);
-  return PetscSinReal(4*PETSC_PI*i*h-PETSC_PI/6.)/2 -2;
+/* Draw vector */
+PetscErrorCode viewDraw(Vec x) {
+  PetscViewer    v1;
+  PetscDraw      draw;
+  PetscErrorCode ierr;
+
+  PetscFunctionBeginUser;
+  ierr = PetscViewerDrawOpen(PETSC_COMM_WORLD,0,"",80,380,400,160,&v1);CHKERRQ(ierr);
+  ierr = PetscViewerDrawGetDraw(v1,0,&draw);CHKERRQ(ierr);
+  ierr = PetscDrawSetDoubleBuffer(draw);CHKERRQ(ierr);
+  ierr = PetscDrawSetFromOptions(draw);CHKERRQ(ierr);
+  ierr = VecView(x,v1);CHKERRQ(ierr);
+  ierr = PetscViewerDestroy(&v1);CHKERRQ(ierr);
+  PetscFunctionReturn(0);
 }
 
+#undef __FUNCT__
+#define __FUNCT__ "main"
 int main(int argc,char **args)
 {
   Vec            b,c,x;
@@ -35,11 +39,13 @@ int main(int argc,char **args)
   QPS            qps;
   PetscInt       i,n = 10,col[3],rstart,rend;
   PetscReal      h,value[3];
-  PetscBool      converged;
+  PetscBool      converged,viewSol=PETSC_FALSE,assumeSPD=PETSC_TRUE;
   PetscErrorCode ierr;
 
   ierr = PermonInitialize(&argc,&args,(char *)0,help);if (ierr) return ierr;
   ierr = PetscOptionsGetInt(NULL,NULL,"-n",&n,NULL);CHKERRQ(ierr);
+  ierr = PetscOptionsGetBool(NULL,NULL,"-sol",&viewSol,NULL);CHKERRQ(ierr);
+  ierr = PetscOptionsGetBool(NULL,NULL,"-assume_spd",&assumeSPD,NULL);CHKERRQ(ierr);
 
   /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
   * Setup matrices and vectors
@@ -68,11 +74,9 @@ int main(int argc,char **args)
   value[0] = -1.0; value[1] = 2.0; value[2] = -1.0;
   for (i=rstart; i<rend; i++) {
     col[0] = i-1; col[1] = i; col[2] = i+1;
-    if (i == 1)   col[0] = -1; /* ignore the first value in the second row (Dirichlet BC) */
-    if (i == n-2) col[2] = -1; /* ignore the third value in the second to last row (Dirichlet BC) */
     ierr = MatSetValues(A,1,&i,3,col,value,INSERT_VALUES);CHKERRQ(ierr);
     ierr = VecSetValue(b,i,-15*h*h*2,INSERT_VALUES);CHKERRQ(ierr);
-    ierr = VecSetValue(c,i,fobst(i,n),INSERT_VALUES);CHKERRQ(ierr);
+    ierr = VecSetValue(c,i,1.0,INSERT_VALUES);CHKERRQ(ierr);
   }
   ierr = MatAssemblyBegin(A,MAT_FINAL_ASSEMBLY);CHKERRQ(ierr);
   ierr = MatAssemblyEnd(A,MAT_FINAL_ASSEMBLY);CHKERRQ(ierr);
@@ -86,34 +90,29 @@ int main(int argc,char **args)
   ierr = MatAssemblyEnd(B,MAT_FINAL_ASSEMBLY);CHKERRQ(ierr);
   ierr = MatShift(B,1.0);CHKERRQ(ierr);
 
-  /* Empty null space matrix for dualization */
-  ierr = MatCreateAIJ(PETSC_COMM_WORLD,PETSC_DECIDE,PETSC_DECIDE,n,0,0,NULL,0,NULL,&R);CHKERRQ(ierr);
-  ierr = MatAssemblyBegin(R,MAT_FINAL_ASSEMBLY);CHKERRQ(ierr);
-  ierr = MatAssemblyEnd(R,MAT_FINAL_ASSEMBLY);CHKERRQ(ierr);
-
   /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
   * Setup QP: argmin 1/2 x'Ax -x'b s.t. c <= I*x
   *  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
   ierr = QPCreate(PETSC_COMM_WORLD,&qp);CHKERRQ(ierr);
-  /* Set matrix representing QP operator */
+  /* Set matrix representing QP operator; we assume it being SPD here */
   ierr = QPSetOperator(qp,A);CHKERRQ(ierr);
+  if (assumeSPD) {
+    ierr = MatSetOption(A,MAT_SPD,PETSC_TRUE);CHKERRQ(ierr);
+  }
 
   /* Set right hand side */
   ierr = QPSetRhs(qp,b);CHKERRQ(ierr);
-  /* Set initial guess.
+  /* Set initial guess. 
   * THIS VECTOR WILL ALSO HOLD THE SOLUTION OF QP */
   ierr = QPSetInitialVector(qp,x);CHKERRQ(ierr);
-  /* Set inequality constraint c <= Bx in the form -c >= -Bx*/
-  ierr = VecScale(c,-1.0);CHKERRQ(ierr);
-  ierr = MatScale(B,-1.0);CHKERRQ(ierr);
-  ierr = QPSetIneq(qp,B,c);CHKERRQ(ierr);
-  /* Dualize QP */
-  ierr = QPSetOperatorNullSpace(qp,R);CHKERRQ(ierr);
-  ierr = QPTDualize(qp,MAT_INV_MONOLITHIC,MAT_REG_NONE);CHKERRQ(ierr);
+  /* Set equality constraint B*x = c */
+  ierr = QPSetEq(qp,B,c);CHKERRQ(ierr);
+  /* Permorm transforms based on options database */
+  ierr = QPTFromOptions(qp);CHKERRQ(ierr);
   /* Set runtime options, e.g
   *   -qp_chain_view_kkt */
   ierr = QPSetFromOptions(qp);CHKERRQ(ierr);
-
+  
   /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
   * Setup QPS, i.e. QP Solver
   *   Note the use of PetscObjectComm() to get the same comm as in qp object.
@@ -135,6 +134,8 @@ int main(int argc,char **args)
   /* Check that QPS converged */
   ierr = QPIsSolved(qp,&converged);CHKERRQ(ierr);
   if (!converged) PetscPrintf(PETSC_COMM_WORLD,"QPS did not converge!\n");
+  if (viewSol) ierr = VecView(x,PETSC_VIEWER_STDOUT_WORLD);CHKERRQ(ierr);
+  if (viewSol) ierr = viewDraw(c);CHKERRQ(ierr);
 
   ierr = QPSDestroy(&qps);CHKERRQ(ierr);
   ierr = QPDestroy(&qp);CHKERRQ(ierr);
@@ -150,12 +151,11 @@ int main(int argc,char **args)
 
 
 /*TEST
-  testset:
+  test:
     suffix: 1
-    requires: mumps
     filter: grep -e CONVERGED -e number -e "r ="
+    nsize: {{1 3}separate output}
     args: -n 100 -qps_view_convergence -qp_chain_view_kkt
-    test:
-    test:
-      nsize: 3
+    args: -dual {{0 1}separate output} -assume_spd {{0 1}}
 TEST*/
+
